@@ -1,0 +1,121 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  NODE_VERSION: "18"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# Cache для node_modules между пайплайнами
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - node_modules/
+    - .next/cache/
+
+# Build стадия - сборка Next.js приложения
+build:
+  stage: build
+  image: node:18-alpine
+  before_script:
+    - apk add --no-cache libc6-compat
+    - npm ci --only=production --silent
+  script:
+    - echo "Building Next.js application..."
+    - npm run build
+    - echo "Build completed successfully"
+  artifacts:
+    paths:
+      - .next/
+      - public/
+      - package.json
+      - package-lock.json
+    expire_in: 1 hour
+  only:
+    - main
+    - release
+    - merge_requests
+
+# Test стадия - проверка кода
+test:
+  stage: test
+  image: node:18-alpine
+  before_script:
+    - apk add --no-cache libc6-compat
+    - npm ci --silent
+  script:
+    - echo "Running linter..."
+    - npm run lint
+    - echo "Checking TypeScript types..."
+    - npx tsc --noEmit
+    - echo "All tests passed"
+  only:
+    - main
+    - release
+    - merge_requests
+
+# Deploy стадия - деплой только с release ветки
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client rsync bash
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_SERVER >> ~/.ssh/known_hosts
+  script:
+    - echo "Deploying to production server..."
+    # Создаем директорию для нового деплоя
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "mkdir -p /tmp/nextjs-deploy-$CI_PIPELINE_ID"
+    
+    # Копируем файлы на сервер
+    - rsync -avz --delete .next/ $DEPLOY_USER@$DEPLOY_SERVER:/tmp/nextjs-deploy-$CI_PIPELINE_ID/.next/
+    - rsync -avz --delete public/ $DEPLOY_USER@$DEPLOY_SERVER:/tmp/nextjs-deploy-$CI_PIPELINE_ID/public/
+    - scp package.json package-lock.json $DEPLOY_USER@$DEPLOY_SERVER:/tmp/nextjs-deploy-$CI_PIPELINE_ID/
+    - scp deploy/ecosystem.config.js $DEPLOY_USER@$DEPLOY_SERVER:/tmp/nextjs-deploy-$CI_PIPELINE_ID/
+    - scp deploy/deploy.sh $DEPLOY_USER@$DEPLOY_SERVER:/tmp/nextjs-deploy-$CI_PIPELINE_ID/
+    
+    # Запускаем deploy скрипт на сервере
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "cd /tmp/nextjs-deploy-$CI_PIPELINE_ID && chmod +x deploy.sh && ./deploy.sh $CI_PIPELINE_ID"
+    
+    # Очищаем временные файлы
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "rm -rf /tmp/nextjs-deploy-$CI_PIPELINE_ID"
+    
+    echo "Deployment completed successfully"
+  environment:
+    name: production
+    url: https://trade.kg
+  when: manual
+  only:
+    - release
+  variables:
+    DEPLOY_SERVER: "$PRODUCTION_SERVER"
+    DEPLOY_USER: "$PRODUCTION_USER"
+
+# Rollback джоба на случай проблем
+rollback:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_SERVER >> ~/.ssh/known_hosts
+  script:
+    - echo "Rolling back to previous version..."
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "cd /var/www/tradekg && pm2 stop ecosystem.config.js"
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "cd /var/www && mv tradekg tradekg-failed-$CI_PIPELINE_ID && mv tradekg-backup tradekg"
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER "cd /var/www/tradekg && pm2 start ecosystem.config.js"
+    - echo "Rollback completed"
+  when: manual
+  only:
+    - release
+  environment:
+    name: production
+    url: https://trade.kg
